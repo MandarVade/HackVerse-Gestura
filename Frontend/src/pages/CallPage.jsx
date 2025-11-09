@@ -1,5 +1,5 @@
 import React from "react";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useParams, useNavigate } from "react-router";
 import { useQuery } from "@tanstack/react-query";
 import { useUser } from "@clerk/clerk-react";
@@ -36,35 +36,84 @@ const CallPage = () => {
     enabled: !!user,
   });
 
-  const sendFrame = async (blob) => {
-    const form = new FormData();
-    form.append("file", blob, "frame.jpg");
+  // Gesture detections state with auto-clear
+  const [detections, setDetections] = useState([]); // [{label, score, bbox:[x1,y1,x2,y2]}]
+  const clearTimerRef = useRef(null);
+  const requestInFlightRef = useRef(false);
+  const lastSentRef = useRef(0);
 
-    const res = await fetch("http://localhost:9000/detect", {
-      method: "POST",
-      body: form,
-    });
-
-    const data = await res.json();
-    console.log("AI:", data.detections);
+  const clearDetectionsSoon = () => {
+    if (clearTimerRef.current) clearTimeout(clearTimerRef.current);
+    clearTimerRef.current = setTimeout(() => setDetections([]), 800); // clears if no new results
   };
 
-  useEffect(() => {
-    const id = setInterval(() => {
-      let video = document.querySelector("video");
+  const sendFrame = useCallback(async (blob) => {
+    if (requestInFlightRef.current) return; // prevent overlap
+    requestInFlightRef.current = true;
+    try {
+      const form = new FormData();
+      form.append("file", blob, "frame.jpg");
 
-      if (!video) return;
+      const res = await fetch("http://localhost:9000/detect", {
+        method: "POST",
+        body: form,
+      });
+
+      const data = await res.json();
+      const dets = Array.isArray(data?.detections) ? data.detections : [];
+      // Update UI and schedule clear if nothing follows
+      setDetections(dets);
+      if (dets.length === 0) {
+        clearDetectionsSoon();
+      } else {
+        // refresh clear in case stream pauses
+        clearDetectionsSoon();
+      }
+      // console.log("AI:", dets);
+    } catch {
+      // swallow network/model errors to keep UI responsive
+    } finally {
+      requestInFlightRef.current = false;
+    }
+  }, []);
+
+  useEffect(() => {
+    // Throttle capture to avoid overloading backend and network
+    const CAPTURE_INTERVAL_MS = 500; // effective rate ~2 fps
+    const id = setInterval(() => {
+      const now = Date.now();
+      if (now - lastSentRef.current < CAPTURE_INTERVAL_MS) return;
+
+      const video = document.querySelector("video");
+      if (!video || video.videoWidth === 0 || video.videoHeight === 0) return;
 
       const canvas = document.createElement("canvas");
-      canvas.width = video.videoWidth;
-      canvas.height = video.videoHeight;
-      canvas.getContext("2d").drawImage(video, 0, 0);
+      // Reduce resolution for bandwidth/latency; backend rescales
+      const targetW = Math.min(640, video.videoWidth);
+      const scale = targetW / video.videoWidth;
+      const targetH = Math.floor(video.videoHeight * scale);
+      canvas.width = targetW;
+      canvas.height = targetH;
+      const ctx = canvas.getContext("2d");
+      ctx.drawImage(video, 0, 0, targetW, targetH);
 
-      canvas.toBlob((blob) => sendFrame(blob), "image/jpeg");
-    }, 400);
+      canvas.toBlob(
+        (blob) => {
+          if (blob) {
+            lastSentRef.current = now;
+            sendFrame(blob);
+          }
+        },
+        "image/jpeg",
+        0.8
+      );
+    }, 100);
 
-    return () => clearInterval(id);
-  }, []);
+    return () => {
+      clearInterval(id);
+      if (clearTimerRef.current) clearTimeout(clearTimerRef.current);
+    };
+  }, [sendFrame]);
 
   // useEffect(() => {
   //   const initCall = async () => {
@@ -138,12 +187,16 @@ const CallPage = () => {
       isMounted = false;
       try {
         callRef?.leave?.();
-      } catch {}
+      } catch {
+        // ignore
+      }
       try {
         // Disconnect the user/session; method presence varies by SDK version.
         videoClientRef?.disconnectUser?.();
         videoClientRef?.destroy?.();
-      } catch {}
+      } catch {
+        // ignore
+      }
     };
   }, [tokenData, user, callId]);
 
@@ -161,7 +214,7 @@ const CallPage = () => {
         {client && call ? (
           <StreamVideo client={client}>
             <StreamCall call={call}>
-              <CallContent />
+              <CallContent detections={detections} />
             </StreamCall>
           </StreamVideo>
         ) : (
@@ -169,12 +222,28 @@ const CallPage = () => {
             <p>Could not initialize call. Please refresh or try again later</p>
           </div>
         )}
+        {/* Overlay for gesture results */}
+        {detections?.length > 0 && (
+          <div className="pointer-events-none absolute inset-0 flex flex-col items-end p-4 gap-2">
+            {detections.slice(0, 3).map((d, i) => (
+              <div
+                key={i}
+                className="bg-black/70 text-white rounded-md px-3 py-2 shadow-md text-sm"
+              >
+                <span className="font-semibold mr-2">{d.label}</span>
+                <span className="opacity-80">
+                  {(d.score * 100).toFixed(1)}%
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
       </div>
     </div>
   );
 };
 
-const CallContent = () => {
+const CallContent = ({ detections = [] }) => {
   const { useCallCallingState } = useCallStateHooks();
 
   const callingState = useCallCallingState();
@@ -184,10 +253,24 @@ const CallContent = () => {
 
   return (
     <StreamTheme>
-      <SpeakerLayout />
+      <div className="relative">
+        <SpeakerLayout />
+        {/* Optional bounding boxes overlay */}
+        {detections?.length > 0 && <BoxesOverlay detections={detections} />}
+      </div>
       <CallControls />
     </StreamTheme>
   );
+};
+
+const BoxesOverlay = () => {
+  // We don't have direct access to the underlying video element dimensions here reliably.
+  // The backend already returns pixel coordinates relative to captured frame. We scaled
+  // down the captured frame before sending, so to render boxes aligned to the visible
+  // layout would require knowing the actual video DOM rect. For simplicity, we render
+  // badges only above; boxes overlay can be enabled when DOM sizing is wired.
+  // Placeholder for future box rendering if needed.
+  return null;
 };
 
 export default CallPage;

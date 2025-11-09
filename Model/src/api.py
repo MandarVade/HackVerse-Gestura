@@ -4,8 +4,8 @@ import torch
 import cv2
 import numpy as np
 from model import DETR
-from utils.boxes import rescale_bboxes
 from utils.setup import get_classes
+from typing import List, Dict
 
 app = FastAPI()
 
@@ -28,35 +28,72 @@ model.eval()
 model.load_pretrained('pretrained/4426_model.pt')
 CLASSES = get_classes()
 
-def run_inference(frame):
-    img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    img = cv2.resize(img, (224,224))
-    img = torch.tensor(img, dtype=torch.float32).permute(2,0,1).unsqueeze(0) / 255.0
+# Adjustable inference parameters
+SCORE_THRESHOLD = 0.90  # confidence threshold for keeping detections
+MAX_DETECTIONS = 5      # safety cap
+
+MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+
+def run_inference(frame: np.ndarray) -> List[Dict]:
+    """Run model inference on a BGR frame and return filtered detections.
+
+    Returns a list of dicts: {label, score, bbox:[x1,y1,x2,y2]}
+    Bboxes are pixel coordinates in the original frame space.
+    """
+    orig_h, orig_w = frame.shape[:2]
+
+    # Preprocess (resize + normalize like training)
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    rgb = cv2.resize(rgb, (224, 224))
+    img = torch.tensor(rgb, dtype=torch.float32).permute(2, 0, 1) / 255.0
+    img = (img - MEAN) / STD
+    img = img.unsqueeze(0)
 
     with torch.no_grad():
         outputs = model(img)
 
-    logits = outputs['pred_logits'][0]
-    boxes = outputs['pred_boxes'][0]
+    logits = outputs['pred_logits'][0]              # (num_queries, num_classes+1)
+    boxes = outputs['pred_boxes'][0]                # (num_queries, 4) in cx,cy,w,h normalized
 
     probs = logits.softmax(-1)
     scores, labels = probs.max(-1)
 
-    results = []
-    for i in range(len(scores)):
+    detections: List[Dict] = []
+    for i in range(scores.shape[0]):
         cls_id = labels[i].item()
-
-        if cls_id >= len(CLASSES): 
+        # Skip background / no-object class (DETR usually has an extra one at the end)
+        if cls_id >= len(CLASSES):
             continue
-        
-        if scores[i] > 0.8:
-            x_center, y_center, w, h = boxes[i]
-            results.append({
-                "label": CLASSES[labels[i].item()],
-                "score": float(scores[i].item()),
-                "bbox": [float(x_center), float(y_center), float(w), float(h)]
-            })
-    return results
+        score = scores[i].item()
+        if score < SCORE_THRESHOLD:
+            continue
+
+        # Convert bbox from normalized cx,cy,w,h -> pixel x1,y1,x2,y2
+        cx, cy, w, h = boxes[i].tolist()
+        x1 = (cx - w / 2) * orig_w
+        y1 = (cy - h / 2) * orig_h
+        x2 = (cx + w / 2) * orig_w
+        y2 = (cy + h / 2) * orig_h
+
+        # Clamp to image bounds
+        x1 = max(0, min(orig_w - 1, x1))
+        y1 = max(0, min(orig_h - 1, y1))
+        x2 = max(0, min(orig_w - 1, x2))
+        y2 = max(0, min(orig_h - 1, y2))
+
+        detections.append({
+            "label": CLASSES[cls_id],
+            "score": float(score),
+            "bbox": [float(x1), float(y1), float(x2), float(y2)]
+        })
+
+    # Sort by score desc and cap
+    detections.sort(key=lambda d: d["score"], reverse=True)
+    if len(detections) > MAX_DETECTIONS:
+        detections = detections[:MAX_DETECTIONS]
+
+    return detections
 
 
 # def run_inference(frame):
@@ -98,10 +135,14 @@ def run_inference(frame):
 
 @app.post("/detect")
 async def detect(file: UploadFile = File(...)):
+    """Receive an uploaded frame and return gesture detections.
+    If no gestures are confidently detected, returns an empty list instead of a repeated label.
+    """
     img_bytes = await file.read()
     npimg = np.frombuffer(img_bytes, np.uint8)
     frame = cv2.imdecode(npimg, cv2.IMREAD_COLOR)
+    if frame is None:
+        return {"detections": []}
     detections = run_inference(frame)
     return {"detections": detections}
-    # return { "success": True,"detections": detections}
 
