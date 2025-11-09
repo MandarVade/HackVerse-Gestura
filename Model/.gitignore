@@ -28,6 +28,6 @@ archive
 example_loggers
 
 
-pretrained/
+
 data/
 logs/
